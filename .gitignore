@@ -1,0 +1,3 @@
+# Memory store — git-ignored per Engramory protocol
+# (machine-local, may contain sensitive-but-non-credential detail like server IPs / paths)
+memory/
