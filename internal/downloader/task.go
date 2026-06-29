@@ -83,6 +83,33 @@ func (t *Task) DownloadWithContext(ctx context.Context) error {
 	}
 	defer out.Close()
 
+	// 创建一个通道，用来通知 goroutine "下载完了，可以退出了"
+	// chan struct{} 是 Go 里最轻量的信号通道：struct{}是空结构体，不占内存
+	done := make(chan struct{})
+	defer close(done) // 不管函数如何退出都会关闭通道，避免 goroutine 永远阻塞
+
+	// go 关键字启动一个新的 goroutine 来打印下载进度
+	go func() {
+		// 创建一个定时器，每500ms发一次信号
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		// 监听多个通道的标准写法
+		for {
+			// select同一时间只执行一个case，如果多个case都满足条件，Go会随机选择一个执行
+			select {
+			case <-done:
+				// done通道被关闭，说明下载完成或出错，打印最终进度后退出 goroutine
+				t.printProgressLine()
+				return
+
+			case <-ticker.C:
+				// 每隔 500ms 打印一次进度
+				t.printProgressLine()
+			}
+		}
+	}()
+
 	written, err := io.Copy(&progressWriter{task: t, writer: out}, resp.Body)
 	if err != nil {
 		return t.fail(fmt.Errorf("下载中断: %w", err))
@@ -94,7 +121,7 @@ func (t *Task) DownloadWithContext(ctx context.Context) error {
 	t.updateSpeed()
 
 	elapsed := t.FinishTime.Sub(t.StartTime).Seconds()
-	fmt.Printf("下载完成: %s (%.2f MB, 耗时 %.1fs, 平均速度 %.2f MB/s)\n",
+	fmt.Printf("\n下载完成: %s (%.2f MB, 耗时 %.1fs, 平均速度 %.2f MB/s)\n",
 		t.Dest, float64(written)/1024/1024, elapsed, t.Speed/1024/1024)
 
 	return nil
@@ -146,4 +173,19 @@ func fileNameFromURL(rawURL string) string {
 		return ""
 	}
 	return path.Base(parsed.Path)
+}
+
+func (t *Task) printProgressLine() {
+	mbDownloaded := float64(t.Downloaded) / 1024 / 1024
+	mbSpeed := t.Speed / 1024 / 1024
+
+	if t.TotalSize > 0 {
+		// 知道文件大小，显示百分比
+		mbTotal := float64(t.TotalSize) / 1024 / 1024
+		pct := float64(t.Downloaded) / float64(t.TotalSize) * 100
+		fmt.Printf("\r下载中... %.2f MB / %.2f MB  %.0f%%  %.2f MB/s", mbDownloaded, mbTotal, pct, mbSpeed)
+	} else {
+		// 流模式：只显示已下载的大小和速度
+		fmt.Printf("\r下载中... %.2f MB  %.2f MB/s", mbDownloaded, mbSpeed)
+	}
 }

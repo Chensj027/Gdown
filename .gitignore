@@ -1,3 +1,24 @@
 # Memory store — git-ignored per Engramory protocol
 # (machine-local, may contain sensitive-but-non-credential detail like server IPs / paths)
 memory/
+
+# Go build outputs
+/gdown.exe
+/gdown
+/bin/
+/dist/
+*.exe
+*.test
+
+# Go test and coverage outputs
+coverage.out
+*.cover
+
+# Local download scratch files
+*.part
+*.tmp
+test_download_*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

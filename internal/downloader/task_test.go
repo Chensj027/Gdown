@@ -18,7 +18,11 @@ func TestDownloadWithContextSuccess(t *testing.T) {
 	}))
 	defer server.Close()
 
-	dest := filepath.Join(t.TempDir(), "nested", "file.txt")
+	// 下载到项目根目录，方便手动查看结果
+	dest := filepath.Join("..", "..", "test_download_success.txt")
+	// 测试结束后清理文件
+	t.Cleanup(func() { os.Remove(dest) })
+
 	task := NewTask(server.URL+"/file.txt", dest)
 
 	if err := task.DownloadWithContext(context.Background()); err != nil {
@@ -55,7 +59,8 @@ func TestDownloadWithContextHTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	task := NewTask(server.URL, filepath.Join(t.TempDir(), "file.txt"))
+	task := NewTask(server.URL, filepath.Join("..", "..", "test_download_error.txt"))
+	t.Cleanup(func() { os.Remove(filepath.Join("..", "..", "test_download_error.txt")) })
 
 	err := task.DownloadWithContext(context.Background())
 	if err == nil {
@@ -73,7 +78,8 @@ func TestDownloadWithContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	dest := filepath.Join(t.TempDir(), "file.txt")
+	dest := filepath.Join("..", "..", "test_download_canceled.txt")
+	t.Cleanup(func() { os.Remove(dest) })
 	task := NewTask("https://example.invalid/file.txt", dest)
 
 	err := task.DownloadWithContext(ctx)
