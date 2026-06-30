@@ -44,6 +44,16 @@ func TestParseArgs(t *testing.T) {
 			},
 		},
 		{
+			name: "resume and concurrent flags",
+			args: []string{"-o", "file.jpg", "-resume", "-concurrent", "4", "https://example.com/file.jpg"},
+			want: config{
+				URL:        "https://example.com/file.jpg",
+				Dest:       "file.jpg",
+				Concurrent: 4,
+				Resume:     true,
+			},
+		},
+		{
 			name:      "missing output",
 			args:      []string{"https://example.com/file.jpg"},
 			wantError: true,
@@ -56,6 +66,16 @@ func TestParseArgs(t *testing.T) {
 		{
 			name:      "too many URLs with output flag",
 			args:      []string{"-o", "file.jpg", "https://example.com/a.jpg", "https://example.com/b.jpg"},
+			wantError: true,
+		},
+		{
+			name:      "zero concurrent",
+			args:      []string{"-o", "file.jpg", "-concurrent", "0", "https://example.com/file.jpg"},
+			wantError: true,
+		},
+		{
+			name:      "too many concurrent workers",
+			args:      []string{"-o", "file.jpg", "-concurrent", "33", "https://example.com/file.jpg"},
 			wantError: true,
 		},
 	}

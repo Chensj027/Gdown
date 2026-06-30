@@ -36,9 +36,10 @@ type Task struct {
 // NewTask 构造一个下载任务。
 func NewTask(rawURL, dest string) *Task {
 	return &Task{
-		URL:      rawURL,
-		Dest:     dest,
-		FileName: fileNameFromURL(rawURL),
+		URL:        rawURL,
+		Dest:       dest,
+		FileName:   fileNameFromURL(rawURL),
+		Concurrent: 1,
 	}
 }
 
@@ -48,6 +49,9 @@ func (t *Task) WithResume() *Task {
 }
 
 func (t *Task) WithConcurrent(n int) *Task {
+	if n < 1 {
+		n = 1
+	}
 	t.Concurrent = n
 	return t
 }
@@ -93,10 +97,15 @@ func (t *Task) DownloadWithContext(ctx context.Context) error {
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 		// 服务器支持断点续传，继续下载
-		t.TotalSize = t.Downloaded + resp.ContentLength
+		if resp.ContentLength > 0 {
+			t.TotalSize = t.Downloaded + resp.ContentLength
+		} else {
+			t.TotalSize = 0
+			fmt.Println("无法获取剩余文件大小，将以流模式续传")
+		}
 	case http.StatusOK:
 		// 服务器不支持断点续传，重新下载
-		t.Downloaded = 0
+		atomic.StoreInt64(&t.Downloaded, 0)
 		if resp.ContentLength > 0 {
 			t.TotalSize = resp.ContentLength
 		} else {
@@ -112,7 +121,20 @@ func (t *Task) DownloadWithContext(ctx context.Context) error {
 
 	// 如果并发数大于1，并且文件大小已知，则使用并发下载
 	if t.Concurrent > 1 && t.TotalSize > 0 && t.Downloaded == 0 {
-		return t.downloadConcurrent(ctx)
+		supportsRange, err := t.supportsRange(ctx)
+		if err != nil {
+			return t.fail(err)
+		}
+		if supportsRange {
+			// 已经确认可以用 Range 分片下载，初始 GET 的响应体不再需要。
+			// 主动关闭可以避免大文件响应体一直占着连接。
+			resp.Body.Close()
+			if err := t.downloadConcurrent(ctx); err != nil {
+				return t.fail(err)
+			}
+			return nil
+		}
+		fmt.Println("服务器不支持 Range，并发下载降级为单线程")
 	}
 
 	var out *os.File
@@ -131,8 +153,8 @@ func (t *Task) DownloadWithContext(ctx context.Context) error {
 		defer out.Close()
 	}
 
-	done := t.startProgress()
-	defer close(done)
+	stopProgress := t.startProgress()
+	defer stopProgress()
 
 	_, err = io.Copy(&progressWriter{task: t, writer: out}, resp.Body)
 	if err != nil {
@@ -144,8 +166,9 @@ func (t *Task) DownloadWithContext(ctx context.Context) error {
 	t.updateSpeed()
 
 	elapsed := t.FinishTime.Sub(t.StartTime).Seconds()
+	downloaded := atomic.LoadInt64(&t.Downloaded)
 	fmt.Printf("\n下载完成: %s (%.2f MB, 耗时 %.1fs, 平均速度 %.2f MB/s)\n",
-		t.Dest, float64(t.Downloaded)/1024/1024, elapsed, t.Speed/1024/1024)
+		t.Dest, float64(downloaded)/1024/1024, elapsed, t.Speed/1024/1024)
 
 	return nil
 }
@@ -157,13 +180,16 @@ func (t *Task) fail(err error) error {
 }
 
 func (t *Task) updateSpeed() {
+	t.Speed = t.currentSpeed()
+}
+
+func (t *Task) currentSpeed() float64 {
 	downloaded := atomic.LoadInt64(&t.Downloaded)
 	elapsed := time.Since(t.StartTime).Seconds()
 	if elapsed <= 0 {
-		t.Speed = 0
-		return
+		return 0
 	}
-	t.Speed = float64(downloaded) / elapsed
+	return float64(downloaded) / elapsed
 }
 
 type progressWriter struct {
@@ -175,7 +201,6 @@ func (w *progressWriter) Write(p []byte) (int, error) {
 	n, err := w.writer.Write(p)
 	if n > 0 {
 		atomic.AddInt64(&w.task.Downloaded, int64(n))
-		w.task.updateSpeed()
 	}
 	return n, err
 }
@@ -199,10 +224,33 @@ func fileNameFromURL(rawURL string) string {
 	return path.Base(parsed.Path)
 }
 
+func (t *Task) supportsRange(ctx context.Context) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.URL, nil)
+	if err != nil {
+		return false, fmt.Errorf("创建 Range 探测请求失败: %w", err)
+	}
+	req.Header.Set("Range", "bytes=0-0")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("Range 探测请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		return true, nil
+	case http.StatusOK:
+		return false, nil
+	default:
+		return false, fmt.Errorf("Range 探测失败，服务器返回 %s", resp.Status)
+	}
+}
+
 func (t *Task) printProgressLine() {
 	downloaded := atomic.LoadInt64(&t.Downloaded)
 	mbDownloaded := float64(downloaded) / 1024 / 1024
-	mbSpeed := t.Speed / 1024 / 1024
+	mbSpeed := t.currentSpeed() / 1024 / 1024
 
 	if t.TotalSize > 0 {
 		// 知道文件大小，显示百分比
@@ -215,13 +263,16 @@ func (t *Task) printProgressLine() {
 	}
 }
 
-func (t *Task) startProgress() chan struct{} {
+func (t *Task) startProgress() func() {
 	// 创建一个通道，用来通知 goroutine "下载完了，可以退出了"
 	// chan struct{} 是 Go 里最轻量的信号通道：struct{}是空结构体，不占内存
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 
 	// go 关键字启动一个新的 goroutine 来打印下载进度
 	go func() {
+		defer close(stopped)
+
 		// 创建一个定时器，每500ms发一次信号
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
@@ -242,29 +293,46 @@ func (t *Task) startProgress() chan struct{} {
 		}
 	}()
 
-	return done
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 func (t *Task) downloadConcurrent(ctx context.Context) error {
-	// 计算每个分片的大小
-	chunkSize := t.TotalSize / int64(t.Concurrent)
+	// 文件很小时，并发数可能大于字节数；这里把 worker 数压到合理范围，
+	// 避免出现 0 字节分片，比如 3 字节文件却开 8 个 goroutine。
+	workers := t.Concurrent
+	if int64(workers) > t.TotalSize {
+		workers = int(t.TotalSize)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	// 计算每个分片的大小。最后一个分片会吃掉余数。
+	chunkSize := t.TotalSize / int64(workers)
 
 	// 创建并打开文件
 	file, err := os.Create(t.Dest)
 	if err != nil {
-		return t.fail(fmt.Errorf("创建文件失败：%w", err))
+		return fmt.Errorf("创建文件失败: %w", err)
 	}
 	defer file.Close()
 
+	if err := file.Truncate(t.TotalSize); err != nil {
+		return fmt.Errorf("预分配文件大小失败: %w", err)
+	}
+
 	// 启动进度显示 goroutine
-	done := t.startProgress()
-	defer close(done)
+	stopProgress := t.startProgress()
+	defer stopProgress()
 
 	// 启动多个 goroutine 下载分片
 	var wg sync.WaitGroup
 	var firstErr error
 	var errOnce sync.Once
-	for i := 0; i < t.Concurrent; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
@@ -272,11 +340,12 @@ func (t *Task) downloadConcurrent(ctx context.Context) error {
 			// 计算当前分片的起始和结束字节
 			start := int64(index) * chunkSize
 			var end int64
-			if index == t.Concurrent-1 {
+			if index == workers-1 {
 				end = t.TotalSize - 1 // 最后一个分片可能比其他分片大，直接取到文件末尾
 			} else {
 				end = start + chunkSize - 1
 			}
+			expected := end - start + 1
 
 			// 创建 Range 请求
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.URL, nil)
@@ -294,23 +363,42 @@ func (t *Task) downloadConcurrent(ctx context.Context) error {
 			}
 			defer resp.Body.Close()
 
-			// 读 body
-			buf, err := io.ReadAll(resp.Body)
-			if err != nil {
-				errOnce.Do(func() { firstErr = fmt.Errorf("分片 %d 读取失败: %w", index, err) })
+			if resp.StatusCode != http.StatusPartialContent {
+				errOnce.Do(func() {
+					firstErr = fmt.Errorf("分片 %d 不支持 Range，服务器返回 %s", index, resp.Status)
+				})
 				return
 			}
 
-			// 写入文件
-			_, err = file.WriteAt(buf, start)
+			if resp.ContentLength >= 0 && resp.ContentLength != expected {
+				errOnce.Do(func() {
+					firstErr = fmt.Errorf("分片 %d 长度不匹配: got %d, want %d", index, resp.ContentLength, expected)
+				})
+				return
+			}
+
+			// 使用 LimitedReader 限制每个 goroutine 最多写入自己负责的字节范围。
+			// 这样即使服务器多返回了数据，也不会越界写坏其他分片。
+			limited := &io.LimitedReader{
+				R: resp.Body,
+				N: expected,
+			}
+			writer := &writeAtProgressWriter{
+				task:   t,
+				file:   file,
+				offset: start,
+			}
+			written, err := io.CopyBuffer(writer, limited, make([]byte, 32*1024))
 			if err != nil {
 				errOnce.Do(func() { firstErr = fmt.Errorf("分片 %d 写入失败: %w", index, err) })
 				return
 			}
-
-			// 更新进度
-			atomic.AddInt64(&t.Downloaded, int64(len(buf)))
-			t.updateSpeed()
+			if written != expected {
+				errOnce.Do(func() {
+					firstErr = fmt.Errorf("分片 %d 下载不完整: got %d, want %d", index, written, expected)
+				})
+				return
+			}
 		}(i)
 	}
 
@@ -318,7 +406,7 @@ func (t *Task) downloadConcurrent(ctx context.Context) error {
 	wg.Wait()
 
 	if firstErr != nil {
-		return t.fail(firstErr)
+		return firstErr
 	}
 
 	t.FinishTime = time.Now()
@@ -326,8 +414,24 @@ func (t *Task) downloadConcurrent(ctx context.Context) error {
 	t.updateSpeed()
 
 	elapsed := t.FinishTime.Sub(t.StartTime).Seconds()
+	downloaded := atomic.LoadInt64(&t.Downloaded)
 	fmt.Printf("\n并发下载完成: %s (%.2f MB, 耗时 %.1fs, 平均速度 %.2f MB/s)\n",
-		t.Dest, float64(t.Downloaded)/1024/1024, elapsed, t.Speed/1024/1024)
+		t.Dest, float64(downloaded)/1024/1024, elapsed, t.Speed/1024/1024)
 
 	return nil
+}
+
+type writeAtProgressWriter struct {
+	task   *Task
+	file   *os.File
+	offset int64
+}
+
+func (w *writeAtProgressWriter) Write(p []byte) (int, error) {
+	n, err := w.file.WriteAt(p, w.offset)
+	if n > 0 {
+		w.offset += int64(n)
+		atomic.AddInt64(&w.task.Downloaded, int64(n))
+	}
+	return n, err
 }

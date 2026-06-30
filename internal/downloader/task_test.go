@@ -19,11 +19,7 @@ func TestDownloadWithContextSuccess(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// 下载到项目根目录，方便手动查看结果
-	dest := filepath.Join("..", "..", "test_download_success.txt")
-	// 测试结束后清理文件
-	t.Cleanup(func() { os.Remove(dest) })
-
+	dest := filepath.Join(t.TempDir(), "test_download_success.txt")
 	task := NewTask(server.URL+"/file.txt", dest)
 
 	if err := task.DownloadWithContext(context.Background()); err != nil {
@@ -60,8 +56,7 @@ func TestDownloadWithContextHTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	task := NewTask(server.URL, filepath.Join("..", "..", "test_download_error.txt"))
-	t.Cleanup(func() { os.Remove(filepath.Join("..", "..", "test_download_error.txt")) })
+	task := NewTask(server.URL, filepath.Join(t.TempDir(), "test_download_error.txt"))
 
 	err := task.DownloadWithContext(context.Background())
 	if err == nil {
@@ -79,8 +74,7 @@ func TestDownloadWithContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	dest := filepath.Join("..", "..", "test_download_canceled.txt")
-	t.Cleanup(func() { os.Remove(dest) })
+	dest := filepath.Join(t.TempDir(), "test_download_canceled.txt")
 	task := NewTask("https://example.invalid/file.txt", dest)
 
 	err := task.DownloadWithContext(ctx)
@@ -97,21 +91,24 @@ func TestDownloadWithResume(t *testing.T) {
 	t.Run("resume with 206", func(t *testing.T) {
 		const body = "hello from gdown"
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Range") != "" {
-				w.Header().Set("Content-Length", "16")
-				w.WriteHeader((http.StatusPartialContent))
+			var start int
+			if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-", &start); err == nil {
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)-start))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte(body[start:]))
+				return
 			} else {
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 				w.WriteHeader(http.StatusOK)
 			}
 			_, _ = w.Write([]byte(body))
 		}))
 		defer server.Close()
 
-		dest := filepath.Join("..", "..", "test_download_resume.txt")
-		t.Cleanup(func() { os.Remove(dest) })
+		dest := filepath.Join(t.TempDir(), "test_download_resume.txt")
 
-		// 先写入8个字节的内容，模拟断点续传
-		oldData := "old_data"
+		// 先写入完整文件的前 8 个字节，模拟“已经下载了一部分”
+		oldData := body[:8]
 		if err := os.WriteFile(dest, []byte(oldData), 0644); err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}
@@ -121,8 +118,8 @@ func TestDownloadWithResume(t *testing.T) {
 			t.Fatalf("DownloadWithContext returned error: %v", err)
 		}
 
-		// 断言1： 下载完成后，文件内容应该是oldData + new_data
-		wantContent := oldData + body
+		// 断言1：下载完成后，文件内容应该恢复为完整 body
+		wantContent := body
 		got, err := os.ReadFile(dest)
 		if err != nil {
 			t.Fatalf("read downloaded file: %v", err)
@@ -131,8 +128,8 @@ func TestDownloadWithResume(t *testing.T) {
 			t.Fatalf("downloaded body = %q, want %q", got, wantContent)
 		}
 
-		// 断言2：Downloaded应该是旧内容 + 新内容的总和
-		wantDownloaded := int64(len(oldData) + len(body))
+		// 断言2：Downloaded 应该是完整文件大小
+		wantDownloaded := int64(len(body))
 		if task.Downloaded != wantDownloaded {
 			t.Fatalf("task.Downloaded = %d, want %d", task.Downloaded, wantDownloaded)
 		}
@@ -153,8 +150,7 @@ func TestDownloadWithResume(t *testing.T) {
 		}))
 		defer server.Close()
 
-		dest := filepath.Join("..", "..", "test_download_resume_200.txt")
-		t.Cleanup(func() { os.Remove(dest) })
+		dest := filepath.Join(t.TempDir(), "test_download_resume_200.txt")
 
 		// 先写入8个字节的内容，模拟断点续传
 		oldData := "old_data"
@@ -206,8 +202,7 @@ func TestDownloadConcurrent(t *testing.T) {
 		}))
 		defer server.Close()
 
-		dest := filepath.Join("..", "..", "test_concurrent.txt")
-		t.Cleanup(func() { os.Remove(dest) })
+		dest := filepath.Join(t.TempDir(), "test_concurrent.txt")
 
 		task := NewTask(server.URL+"/file.bin", dest).WithConcurrent(4)
 		if err := task.DownloadWithContext(context.Background()); err != nil {
@@ -224,6 +219,36 @@ func TestDownloadConcurrent(t *testing.T) {
 		}
 		if !task.Done {
 			t.Fatal("task.Done = false, want true")
+		}
+		if task.Downloaded != int64(len(body)) {
+			t.Fatalf("task.Downloaded = %d, want %d", task.Downloaded, len(body))
+		}
+	})
+
+	t.Run("fallback when range unsupported", func(t *testing.T) {
+		const body = "server ignores range"
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 无论客户端是否带 Range，服务器都返回 200 OK 和完整文件。
+			// gdown 应该识别这种情况，并自动降级为普通单线程下载。
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(body))
+		}))
+		defer server.Close()
+
+		dest := filepath.Join(t.TempDir(), "test_concurrent_fallback.txt")
+		task := NewTask(server.URL+"/file.bin", dest).WithConcurrent(4)
+
+		if err := task.DownloadWithContext(context.Background()); err != nil {
+			t.Fatalf("DownloadWithContext returned error: %v", err)
+		}
+
+		got, err := os.ReadFile(dest)
+		if err != nil {
+			t.Fatalf("read downloaded file: %v", err)
+		}
+		if string(got) != body {
+			t.Fatalf("downloaded body = %q, want %q", got, body)
 		}
 		if task.Downloaded != int64(len(body)) {
 			t.Fatalf("task.Downloaded = %d, want %d", task.Downloaded, len(body))

@@ -12,6 +12,8 @@ import (
 	"gdown/internal/downloader"
 )
 
+const maxConcurrent = 32
+
 // config 保存命令行解析后的配置。
 // 这样 main 只负责“串流程”，具体参数规则可以单独测试。
 type config struct {
@@ -82,7 +84,7 @@ func parseArgs(args []string, stderr io.Writer) (config, error) {
 
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "用法:")
-		fmt.Fprintln(stderr, "  gdown -o <输出文件路径> [-timeout 30s] <URL>")
+		fmt.Fprintln(stderr, "  gdown -o <输出文件路径> [-timeout 30s] [-resume] [-concurrent 4] <URL>")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "兼容旧写法:")
 		fmt.Fprintln(stderr, "  gdown <URL> <输出文件路径>")
@@ -98,6 +100,16 @@ func parseArgs(args []string, stderr io.Writer) (config, error) {
 	if *timeout < 0 {
 		fs.Usage()
 		return config{}, fmt.Errorf("-timeout 不能是负数")
+	}
+
+	if *concurrent < 1 {
+		fs.Usage()
+		return config{}, fmt.Errorf("-concurrent 必须大于等于 1")
+	}
+
+	if *concurrent > maxConcurrent {
+		fs.Usage()
+		return config{}, fmt.Errorf("-concurrent 不能超过 %d", maxConcurrent)
 	}
 
 	positional := fs.Args()
