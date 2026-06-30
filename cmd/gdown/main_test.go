@@ -19,25 +19,28 @@ func TestParseArgs(t *testing.T) {
 			name: "new flag style",
 			args: []string{"-o", "file.jpg", "https://example.com/file.jpg"},
 			want: config{
-				URL:  "https://example.com/file.jpg",
-				Dest: "file.jpg",
+				URL:        "https://example.com/file.jpg",
+				Dest:       "file.jpg",
+				Concurrent: 1,
 			},
 		},
 		{
 			name: "new flag style with timeout",
 			args: []string{"-o", "file.jpg", "-timeout", "30s", "https://example.com/file.jpg"},
 			want: config{
-				URL:     "https://example.com/file.jpg",
-				Dest:    "file.jpg",
-				Timeout: 30 * time.Second,
+				URL:        "https://example.com/file.jpg",
+				Dest:       "file.jpg",
+				Timeout:    30 * time.Second,
+				Concurrent: 1,
 			},
 		},
 		{
 			name: "old positional style",
 			args: []string{"https://example.com/file.jpg", "file.jpg"},
 			want: config{
-				URL:  "https://example.com/file.jpg",
-				Dest: "file.jpg",
+				URL:        "https://example.com/file.jpg",
+				Dest:       "file.jpg",
+				Concurrent: 1,
 			},
 		},
 		{

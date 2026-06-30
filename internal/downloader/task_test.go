@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -179,6 +180,53 @@ func TestDownloadWithResume(t *testing.T) {
 		wantDownloaded := int64(len(body))
 		if task.Downloaded != wantDownloaded {
 			t.Fatalf("task.Downloaded = %d, want %d", task.Downloaded, wantDownloaded)
+		}
+	})
+}
+
+func TestDownloadConcurrent(t *testing.T) {
+	t.Run("multi chunk download", func(t *testing.T) {
+		// 用 20 字节的内容，4 个并发 → 每块 5 字节
+		const body = "AAAAABBBBBCCCCCDDDDD" // 20 字节
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 解析 Range 头，返回对应范围的字节
+			rangeHeader := r.Header.Get("Range")
+			if rangeHeader == "" {
+				// 初始请求：返回 Content-Length，让 gdown 知道文件大小
+				w.Header().Set("Content-Length", "20")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			// Range 请求：解析并返回对应部分
+			var start, end int
+			fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte(body[start : end+1]))
+		}))
+		defer server.Close()
+
+		dest := filepath.Join("..", "..", "test_concurrent.txt")
+		t.Cleanup(func() { os.Remove(dest) })
+
+		task := NewTask(server.URL+"/file.bin", dest).WithConcurrent(4)
+		if err := task.DownloadWithContext(context.Background()); err != nil {
+			t.Fatalf("DownloadWithContext returned error: %v", err)
+		}
+
+		// 断言：文件内容完整
+		got, err := os.ReadFile(dest)
+		if err != nil {
+			t.Fatalf("read downloaded file: %v", err)
+		}
+		if string(got) != body {
+			t.Fatalf("downloaded body = %q, want %q", got, body)
+		}
+		if !task.Done {
+			t.Fatal("task.Done = false, want true")
+		}
+		if task.Downloaded != int64(len(body)) {
+			t.Fatalf("task.Downloaded = %d, want %d", task.Downloaded, len(body))
 		}
 	})
 }

@@ -18,6 +18,9 @@ type config struct {
 	URL     string
 	Dest    string
 	Timeout time.Duration
+
+	Concurrent int
+	Resume     bool
 }
 
 func main() {
@@ -42,10 +45,22 @@ func main() {
 	}
 
 	task := downloader.NewTask(cfg.URL, cfg.Dest)
+	if cfg.Concurrent > 1 {
+		task.WithConcurrent(cfg.Concurrent)
+	}
+	if cfg.Resume {
+		task.WithResume()
+	}
 
 	fmt.Printf("开始下载: %s -> %s\n", cfg.URL, cfg.Dest)
 	if cfg.Timeout > 0 {
 		fmt.Printf("超时限制: %s\n", cfg.Timeout)
+	}
+	if cfg.Concurrent > 1 {
+		fmt.Printf("并发下载线程数: %d\n", cfg.Concurrent)
+	}
+	if cfg.Resume {
+		fmt.Println("断点续传: 已开启")
 	}
 
 	if err := task.DownloadWithContext(ctx); err != nil {
@@ -62,6 +77,8 @@ func parseArgs(args []string, stderr io.Writer) (config, error) {
 
 	output := fs.String("o", "", "输出文件路径")
 	timeout := fs.Duration("timeout", 0, "下载超时时间，例如 30s、2m；0 表示不限制")
+	concurrent := fs.Int("concurrent", 1, "并发下载线程数")
+	resume := fs.Bool("resume", false, "是否开启断点续传")
 
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "用法:")
@@ -92,9 +109,11 @@ func parseArgs(args []string, stderr io.Writer) (config, error) {
 			return config{}, fmt.Errorf("使用 -o 时需要且只需要一个 URL")
 		}
 		return config{
-			URL:     positional[0],
-			Dest:    *output,
-			Timeout: *timeout,
+			URL:        positional[0],
+			Dest:       *output,
+			Timeout:    *timeout,
+			Concurrent: *concurrent,
+			Resume:     *resume,
 		}, nil
 	}
 
@@ -102,9 +121,11 @@ func parseArgs(args []string, stderr io.Writer) (config, error) {
 	// 先保留兼容，等你熟悉 flag 后再考虑是否移除。
 	if len(positional) == 2 {
 		return config{
-			URL:     positional[0],
-			Dest:    positional[1],
-			Timeout: *timeout,
+			URL:        positional[0],
+			Dest:       positional[1],
+			Timeout:    *timeout,
+			Concurrent: *concurrent,
+			Resume:     *resume,
 		}, nil
 	}
 
