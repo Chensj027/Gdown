@@ -90,3 +90,95 @@ func TestDownloadWithContextCanceled(t *testing.T) {
 		t.Fatalf("downloaded file exists or stat failed unexpectedly: %v", statErr)
 	}
 }
+
+func TestDownloadWithResume(t *testing.T) {
+	// 场景1：文件已存在，服务器支持断点续传，返回 206 Partial Content
+	t.Run("resume with 206", func(t *testing.T) {
+		const body = "hello from gdown"
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Range") != "" {
+				w.Header().Set("Content-Length", "16")
+				w.WriteHeader((http.StatusPartialContent))
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+			_, _ = w.Write([]byte(body))
+		}))
+		defer server.Close()
+
+		dest := filepath.Join("..", "..", "test_download_resume.txt")
+		t.Cleanup(func() { os.Remove(dest) })
+
+		// 先写入8个字节的内容，模拟断点续传
+		oldData := "old_data"
+		if err := os.WriteFile(dest, []byte(oldData), 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		task := NewTask(server.URL+"/file.txt", dest).WithResume()
+		if err := task.DownloadWithContext(context.Background()); err != nil {
+			t.Fatalf("DownloadWithContext returned error: %v", err)
+		}
+
+		// 断言1： 下载完成后，文件内容应该是oldData + new_data
+		wantContent := oldData + body
+		got, err := os.ReadFile(dest)
+		if err != nil {
+			t.Fatalf("read downloaded file: %v", err)
+		}
+		if string(got) != wantContent {
+			t.Fatalf("downloaded body = %q, want %q", got, wantContent)
+		}
+
+		// 断言2：Downloaded应该是旧内容 + 新内容的总和
+		wantDownloaded := int64(len(oldData) + len(body))
+		if task.Downloaded != wantDownloaded {
+			t.Fatalf("task.Downloaded = %d, want %d", task.Downloaded, wantDownloaded)
+		}
+
+		// 断言3：Task 标记为完成
+		if !task.Done {
+			t.Fatal("task.Done = false, want true")
+		}
+	})
+
+	// 场景2：文件已存在，服务器不支持断点续传，返回 200 OK
+	t.Run("exist but server returns 200", func(t *testing.T) {
+		const body = "hello from gdown"
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "16")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(body))
+		}))
+		defer server.Close()
+
+		dest := filepath.Join("..", "..", "test_download_resume_200.txt")
+		t.Cleanup(func() { os.Remove(dest) })
+
+		// 先写入8个字节的内容，模拟断点续传
+		oldData := "old_data"
+		if err := os.WriteFile(dest, []byte(oldData), 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		task := NewTask(server.URL+"/file.txt", dest).WithResume()
+		if err := task.DownloadWithContext(context.Background()); err != nil {
+			t.Fatalf("DownloadWithContext returned error: %v", err)
+		}
+
+		// 断言1： 服务器不支持断点续传，文件被覆盖，重新下载，只有新内容
+		got, err := os.ReadFile(dest)
+		if err != nil {
+			t.Fatalf("read downloaded file: %v", err)
+		}
+		if string(got) != body {
+			t.Fatalf("downloaded body = %q, want %q", got, body)
+		}
+
+		// 断言2：Downloaded应该是新内容的长度
+		wantDownloaded := int64(len(body))
+		if task.Downloaded != wantDownloaded {
+			t.Fatalf("task.Downloaded = %d, want %d", task.Downloaded, wantDownloaded)
+		}
+	})
+}

@@ -18,6 +18,8 @@ type Task struct {
 	Dest     string // 保存路径
 	FileName string // 从 URL 提取的文件名
 
+	Resume bool // 是否开启断点续传
+
 	// 状态字段，后续做进度展示或并发下载时会用到。
 	TotalSize  int64
 	Downloaded int64
@@ -37,6 +39,11 @@ func NewTask(rawURL, dest string) *Task {
 	}
 }
 
+func (t *Task) WithResume() *Task {
+	t.Resume = true
+	return t
+}
+
 // Download 使用后台 context 执行下载。
 func (t *Task) Download() error {
 	return t.DownloadWithContext(context.Background())
@@ -52,9 +59,21 @@ func (t *Task) DownloadWithContext(ctx context.Context) error {
 	t.Done = false
 	t.Err = nil
 
+	if t.Resume {
+		// 如果开启断点续传，先检查本地文件是否存在
+		if info, err := os.Stat(t.Dest); err == nil {
+			t.Downloaded = info.Size()
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.URL, nil)
 	if err != nil {
 		return t.fail(fmt.Errorf("创建请求失败: %w", err))
+	}
+
+	if t.Downloaded > 0 {
+		str := fmt.Sprintf("bytes=%d-", t.Downloaded)
+		req.Header.Set("Range", str)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -63,25 +82,41 @@ func (t *Task) DownloadWithContext(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		// 服务器支持断点续传，继续下载
+		t.TotalSize = t.Downloaded + resp.ContentLength
+	case http.StatusOK:
+		// 服务器不支持断点续传，重新下载
+		t.Downloaded = 0
+		if resp.ContentLength > 0 {
+			t.TotalSize = resp.ContentLength
+		} else {
+			fmt.Println("无法获取文件大小，将以流模式下载")
+		}
+	default:
 		return t.fail(fmt.Errorf("服务器返回 %s", resp.Status))
-	}
-
-	if resp.ContentLength > 0 {
-		t.TotalSize = resp.ContentLength
-	} else {
-		fmt.Println("无法获取文件大小，将以流模式下载")
 	}
 
 	if err := ensureParentDir(t.Dest); err != nil {
 		return t.fail(err)
 	}
 
-	out, err := os.Create(t.Dest)
-	if err != nil {
-		return t.fail(fmt.Errorf("创建文件失败: %w", err))
+	var out *os.File
+	if t.Downloaded > 0 {
+		fmt.Printf("断点续传: 已下载 %d 字节，继续下载...\n", t.Downloaded)
+		out, err = os.OpenFile(t.Dest, os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return t.fail(fmt.Errorf("打开文件失败: %w", err))
+		}
+		defer out.Close()
+	} else {
+		out, err = os.Create(t.Dest)
+		if err != nil {
+			return t.fail(fmt.Errorf("创建文件失败: %w", err))
+		}
+		defer out.Close()
 	}
-	defer out.Close()
 
 	// 创建一个通道，用来通知 goroutine "下载完了，可以退出了"
 	// chan struct{} 是 Go 里最轻量的信号通道：struct{}是空结构体，不占内存
@@ -110,19 +145,18 @@ func (t *Task) DownloadWithContext(ctx context.Context) error {
 		}
 	}()
 
-	written, err := io.Copy(&progressWriter{task: t, writer: out}, resp.Body)
+	_, err = io.Copy(&progressWriter{task: t, writer: out}, resp.Body)
 	if err != nil {
 		return t.fail(fmt.Errorf("下载中断: %w", err))
 	}
 
-	t.Downloaded = written
 	t.FinishTime = time.Now()
 	t.Done = true
 	t.updateSpeed()
 
 	elapsed := t.FinishTime.Sub(t.StartTime).Seconds()
 	fmt.Printf("\n下载完成: %s (%.2f MB, 耗时 %.1fs, 平均速度 %.2f MB/s)\n",
-		t.Dest, float64(written)/1024/1024, elapsed, t.Speed/1024/1024)
+		t.Dest, float64(t.Downloaded)/1024/1024, elapsed, t.Speed/1024/1024)
 
 	return nil
 }
